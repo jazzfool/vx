@@ -194,13 +194,7 @@ impl Globals {
         component.unmount(self);
         self.untyped_node_mut(&cref).replace(component);
 
-        for child in self
-            .map
-            .get_mut(&cref.id())
-            .expect("invalid reference")
-            .children()
-            .to_vec()
-        {
+        for child in self.untyped_node(&cref).children().to_vec() {
             self.late_unmount_impl(child, v);
         }
     }
@@ -213,13 +207,7 @@ impl Globals {
     }
 
     fn unmount_children(&mut self, cref: &impl CRef, reverse: bool) {
-        for child in self
-            .map
-            .get_mut(&cref.id())
-            .expect("invalid reference")
-            .children()
-            .to_vec()
-        {
+        for child in self.untyped_node(cref).children().to_vec() {
             if reverse {
                 self.reverse_unmount(child);
             } else {
