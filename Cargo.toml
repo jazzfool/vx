@@ -5,5 +5,7 @@ authors = ["jazzfool <saveuselon@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-skia-safe = "0.27"
+reclutch = { git = "https://github.com/jazzfool/reclutch" }
 glutin = "0.24"
+derivative = "2.1"
+thiserror = "1.0"
