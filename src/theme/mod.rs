@@ -67,6 +67,7 @@ pub mod painters {
     //! For a theme to support `kit`, it must implement all of these.
 
     pub const BUTTON: &str = "button";
+    pub const LABEL: &str = "label";
 }
 
 pub mod colors {

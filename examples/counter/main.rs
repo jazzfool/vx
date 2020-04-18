@@ -1,46 +1,38 @@
 struct Counter {
     count: u32,
-    label: vx::kit::LabelRef,
+    btn: vx::kit::ButtonRef,
 }
 
 impl vx::core::ComponentFactory for Counter {
     fn new(globals: &mut vx::core::Globals, cref: vx::core::ComponentRef<Self>) -> Self {
-        let incr: vx::kit::ButtonRef = globals.child(cref);
-        let decr: vx::kit::ButtonRef = globals.child(cref);
+        let btn: vx::kit::ButtonRef = globals.child(cref);
 
-        globals.listen(
-            cref,
-            move |globals| &mut globals.get_mut(incr).on_click,
-            move |globals, _| {
-                globals.get_mut(cref).count += 1;
-            },
-            Default::default(),
-        );
+        globals.listen(globals.get(btn).on_click, cref, move |globals, _| {
+            globals.get_mut(cref).count += 1;
+            globals.update(cref, vx::core::Repaint::No, vx::core::Propagate::No);
+        });
 
-        globals.listen(
-            cref,
-            move |globals| &mut globals.get_mut(decr).on_click,
-            move |globals, _| {
-                globals.get_mut(cref).count -= 1;
-            },
-            Default::default(),
-        );
-
-        Counter {
-            count: 0,
-            label: globals.child(cref),
-        }
+        Counter { count: 0, btn }
     }
 }
 
 impl vx::core::Component for Counter {
+    fn unmount(&mut self, _globals: &mut vx::core::Globals) {
+        println!("unmount");
+    }
+
     fn update(&mut self, _globals: &mut vx::core::Globals) {
-        println!("update!");
+        println!("count = {}", self.count);
     }
 }
 
 // TODO(jazzfool): make a counter
 fn main() {
-    let (globals, root): (_, vx::core::ComponentRef<Counter>) =
+    let (mut globals, root): (_, vx::core::ComponentRef<Counter>) =
         vx::core::Globals::new(vx::theme::flat::FlatTheme);
+    globals.update(root, Default::default(), Default::default());
+
+    for _ in 0..1000 {
+        globals.emit(globals.get(globals.get(root).btn).on_click, &());
+    }
 }

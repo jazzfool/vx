@@ -1,7 +1,7 @@
 use {
     crate::{signal, theme},
     reclutch::display as gfx,
-    std::{any::Any, collections::HashMap},
+    std::{any::Any, collections::HashMap, rc::Rc},
 };
 
 /// Core component trait, implemented by all distinct elements of a UI.
@@ -28,13 +28,15 @@ pub trait Component: AsBoxAny + 'static {
     ///
     /// This should return a list of display commands that should be used to display this component.
     #[inline]
-    fn display(&self) -> Vec<gfx::DisplayCommand> {
+    fn display(&mut self) -> Vec<gfx::DisplayCommand> {
         Default::default()
     }
 
     /// Invoked by [`Globals::update`](Globals::update), either as a result of propagation or directly.
     ///
     /// Update logic should be placed here.
+    ///
+    /// Do not emit any events here.
     #[inline]
     fn update(&mut self, _globals: &mut Globals) {}
 }
@@ -127,6 +129,7 @@ trait InternalNode: Node {
 
     fn take(&mut self) -> Box<dyn Component>;
     fn replace(&mut self, component: Box<dyn Component>);
+    fn is_taken(&self) -> bool;
 
     fn detach_listeners(&mut self, globals: &mut Globals);
     fn repaint(&mut self);
@@ -165,6 +168,11 @@ impl<T: Component> InternalNode for ComponentNode<T> {
     }
 
     #[inline]
+    fn is_taken(&self) -> bool {
+        self.component.is_none()
+    }
+
+    #[inline]
     fn detach_listeners(&mut self, globals: &mut Globals) {
         for listener in &mut self.listeners {
             listener.detach(globals);
@@ -194,19 +202,18 @@ impl<T: Component> Node for ComponentNode<T> {
     }
 }
 
-struct ListenerPair<T, F: FnMut(&mut Globals) -> &mut signal::Signal<T>> {
+struct ListenerPair {
     listener: signal::ListenerRef,
-    signal_lens: F,
+    signal: u64,
 }
 
-trait Listener {
-    fn detach(&mut self, globals: &mut Globals);
-}
-
-impl<T, F: FnMut(&mut Globals) -> &mut signal::Signal<T>> Listener for ListenerPair<T, F> {
-    #[inline]
-    fn detach(&mut self, globals: &mut Globals) {
-        (self.signal_lens)(globals).remove_listener(self.listener);
+impl ListenerPair {
+    fn detach(&self, globals: &mut Globals) {
+        if let Some(signal) = globals.signal_map.get_mut(&self.signal).unwrap().as_mut() {
+            signal.detach(self.listener);
+        } else {
+            globals.listener_removal.push(self.listener);
+        }
     }
 }
 
@@ -215,7 +222,7 @@ pub struct ComponentNode<T: Component> {
     parent: UntypedComponentRef,
     children: Vec<UntypedComponentRef>,
     component: Option<T>,
-    listeners: Vec<Box<dyn Listener>>,
+    listeners: Vec<ListenerPair>,
     cmds: gfx::CommandGroup,
 }
 
@@ -258,10 +265,58 @@ impl Default for Update {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derivative(Debug(bound = ""))]
+#[derivative(Clone(bound = ""))]
+#[derivative(Copy(bound = ""))]
+#[derivative(PartialEq(bound = ""))]
+#[derivative(Eq(bound = ""))]
+#[derivative(PartialOrd(bound = ""))]
+#[derivative(Ord(bound = ""))]
+#[derivative(Hash(bound = ""))]
+pub struct SignalRef<T>(u64, std::marker::PhantomData<T>);
+
+impl<T> SignalRef<T> {
+    #[inline]
+    pub(crate) fn null() -> Self {
+        SignalRef(std::u64::MAX, Default::default())
+    }
+}
+
+trait InternalSignal {
+    fn emit(&mut self, globals: &mut Globals, event: &dyn Any);
+    fn listen(&mut self, listener: &dyn Any) -> signal::ListenerRef;
+    fn detach(&mut self, listener: signal::ListenerRef);
+}
+
+impl<T: 'static> InternalSignal for signal::Signal<T> {
+    #[inline]
+    fn emit(&mut self, globals: &mut Globals, event: &dyn Any) {
+        self.emit(globals, event.downcast_ref::<T>().unwrap())
+    }
+
+    fn listen(&mut self, listener: &dyn Any) -> signal::ListenerRef {
+        self.listen_rc(Rc::clone(
+            listener
+                .downcast_ref::<Rc<dyn Fn(&mut Globals, &T)>>()
+                .unwrap(),
+        ))
+    }
+
+    #[inline]
+    fn detach(&mut self, listener: signal::ListenerRef) {
+        self.remove_listener(listener);
+    }
+}
+
 pub struct Globals {
-    on_theme_changed: Option<signal::Signal<()>>,
+    pub on_theme_changed: SignalRef<()>,
     map: HashMap<u64, Box<dyn InternalNode>>,
-    next_id: u64,
+    signal_map: HashMap<u64, Option<Box<dyn InternalSignal>>>,
+    listener_removal: Vec<signal::ListenerRef>,
+    next_component_id: u64,
+    next_signal_id: u64,
     theme: Box<dyn theme::Theme>,
 }
 
@@ -269,15 +324,20 @@ impl Globals {
     /// Creates a new `Globals` with a root component and initial theme.
     pub fn new<T: ComponentFactory>(theme: impl theme::Theme + 'static) -> (Self, ComponentRef<T>) {
         let mut globals = Globals {
-            on_theme_changed: Default::default(),
+            on_theme_changed: SignalRef::null(),
 
             map: Default::default(),
-            next_id: 0,
+            signal_map: Default::default(),
+            listener_removal: Default::default(),
+            next_component_id: 0,
+            next_signal_id: 0,
             theme: Box::new(theme),
         };
 
-        let root = ComponentRef(globals.next_id, Default::default());
-        globals.next_id += 1;
+        globals.on_theme_changed = globals.signal();
+
+        let root = ComponentRef(globals.next_component_id, Default::default());
+        globals.next_component_id += 1;
         globals.map.insert(
             root.0,
             Box::new(ComponentNode::<T> {
@@ -300,7 +360,7 @@ impl Globals {
         self.node(cref)
             .component
             .as_ref()
-            .expect("component is `self`; use `self` instead")
+            .expect("a reference to the component is already being used")
     }
 
     /// Mutably retrieves the `Component` behind a reference.
@@ -309,7 +369,24 @@ impl Globals {
         self.node_mut(cref)
             .component
             .as_mut()
-            .expect("component is `self`; use `self` instead")
+            .expect("a reference to the component is already being used")
+    }
+
+    /// Attempts to immutably retrieve the `Component` behind a reference, returning `None` if it failed.
+    ///
+    /// It will return `None` if;
+    /// - Component type doesn't match.
+    /// - The component is being used somewhere in the stack trace.
+    /// - The component reference is invalid (component has been unmounted).
+    #[inline]
+    pub fn try_get<T: Component>(&self, cref: ComponentRef<T>) -> Option<&T> {
+        self.try_node(cref)?.component.as_ref()
+    }
+
+    /// Attempts to mutably retrieve the `Component` behind a reference, returning `None` if it failed.
+    #[inline]
+    pub fn try_get_mut<T: Component>(&mut self, cref: ComponentRef<T>) -> Option<&mut T> {
+        self.try_node_mut(cref)?.component.as_mut()
     }
 
     /// Immutably retrieves the `ComponentNode` behind a reference.
@@ -332,6 +409,25 @@ impl Globals {
             .expect("mismatching reference type")
     }
 
+    /// Attempts to immutably retrieve the `Component` behind a reference, returning `None` if it failed.
+    pub fn try_node<T: Component>(&self, cref: ComponentRef<T>) -> Option<&ComponentNode<T>> {
+        self.map
+            .get(&cref.0)?
+            .as_any()
+            .downcast_ref::<ComponentNode<T>>()
+    }
+
+    /// Attempts to mutably retrieve the `ComponentNode` behind a reference, returning `None` if it failed.
+    pub fn try_node_mut<T: Component>(
+        &mut self,
+        cref: ComponentRef<T>,
+    ) -> Option<&mut ComponentNode<T>> {
+        self.map
+            .get_mut(&cref.0)?
+            .as_any_mut()
+            .downcast_mut::<ComponentNode<T>>()
+    }
+
     /// Returns an immutable dynamic reference to a node behind a component reference.
     #[inline]
     pub fn untyped_node(&self, cref: impl CRef) -> &dyn Node {
@@ -342,6 +438,34 @@ impl Globals {
     #[inline]
     pub fn untyped_node_mut(&mut self, cref: impl CRef) -> &mut dyn Node {
         self.untyped_internal_node_mut(&cref).as_node_mut()
+    }
+
+    /// Returns `true` if the provided reference is valid (hasn't been unmounted), otherwise `false`.
+    #[inline]
+    pub fn is_valid(&self, cref: impl CRef) -> bool {
+        self.map.contains_key(&cref.id())
+    }
+
+    /// Returns `true` if the `Component` isn't in the stack trace and is available, otherwise `false`.
+    ///
+    /// This check is a superset of `is_valid`, in that if this returns `true` then `is_valid` must also return `true` too.
+    #[inline]
+    pub fn is_available(&self, cref: impl CRef) -> bool {
+        self.map
+            .get(&cref.id())
+            .and_then(|x| Some(!x.is_taken()))
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if the `Component` is of type `T`, otherwise `false`.
+    ///
+    /// This check is a superset of `is_valid`, in that if this returns `true` then `is_valid` must also return `true` too.
+    #[inline]
+    pub fn is_of_type<T: Component>(&self, cref: ComponentRef<T>) -> bool {
+        self.map
+            .get(&cref.id())
+            .and_then(|x| Some(x.type_id() == std::any::TypeId::of::<T>()))
+            .unwrap_or(false)
     }
 
     /// Unmounts and removes a component node (and it's children).
@@ -375,8 +499,8 @@ impl Globals {
 
     /// Creates a new component as a child of an existing component.
     pub fn child<T: ComponentFactory>(&mut self, pcref: impl CRef) -> ComponentRef<T> {
-        let cref = ComponentRef(self.next_id, Default::default());
-        self.next_id += 1;
+        let cref = ComponentRef(self.next_component_id, Default::default());
+        self.next_component_id += 1;
 
         self.untyped_internal_node_mut(&pcref)
             .push_child(UntypedComponentRef(cref.0));
@@ -394,28 +518,6 @@ impl Globals {
         self.node_mut(cref).component = Some(T::new(self, cref));
 
         cref
-    }
-
-    /// Adds a managed listener to a signal.
-    ///
-    /// "Managed" implies that the listener will be removed when `cref` is unmounted.
-    pub fn listen<C: Component, T: 'static>(
-        &mut self,
-        cref: ComponentRef<C>,
-        mut signal_lens: impl FnMut(&mut Globals) -> &mut signal::Signal<T> + 'static,
-        mut listener: impl FnMut(&mut Globals, &T) + 'static,
-        update: Update,
-    ) {
-        let listener = signal_lens(self).listen(move |globals, event| {
-            listener(globals, event);
-            if let Update::Yes(repaint, propagate) = update {
-                globals.update(cref, repaint, propagate);
-            }
-        });
-        self.node_mut(cref).listeners.push(Box::new(ListenerPair {
-            listener,
-            signal_lens,
-        }));
     }
 
     /// Invokes an update for a specified component, optionally recursively propagating to children and scheduling a repaint.
@@ -448,17 +550,54 @@ impl Globals {
     /// Components will only update their painters if they correctly handle `on_theme_changed`.
     pub fn set_theme(&mut self, theme: impl theme::Theme + 'static) {
         self.theme = Box::new(theme);
-        let mut signal = self.on_theme_changed.take().unwrap();
-        signal.emit(self, &());
-        self.on_theme_changed = Some(signal);
+        self.emit(self.on_theme_changed, &());
     }
 
-    /// Returns a mutable reference to the `on_theme_changed` singal, emitted whenever `set_theme` is invoked.
-    #[inline]
-    pub fn on_theme_changed(&mut self) -> &mut signal::Signal<()> {
-        self.on_theme_changed.as_mut().unwrap()
+    /// Creates a new signal.
+    pub fn signal<T: 'static>(&mut self) -> SignalRef<T> {
+        let sref = SignalRef(self.next_signal_id, Default::default());
+        self.next_signal_id += 1;
+        self.signal_map
+            .insert(sref.0, Some(Box::new(signal::Signal::<T>::new())));
+        sref
     }
 
+    /// Emits an event for a signal.
+    pub fn emit<T: 'static>(&mut self, sref: SignalRef<T>, event: &T) {
+        if let Some(mut signal) = self.signal_map.get_mut(&sref.0).and_then(|x| x.take()) {
+            signal.emit(self, event);
+            for listener in std::mem::take(&mut self.listener_removal) {
+                signal.detach(listener);
+            }
+            *self.signal_map.get_mut(&sref.0).unwrap() = Some(signal);
+        }
+    }
+
+    /// Adds a managed listener to a signal.
+    ///
+    /// "Managed" implies that the listener will be removed when `cref` is unmounted.
+    pub fn listen<T: 'static, C: Component>(
+        &mut self,
+        sref: SignalRef<T>,
+        cref: ComponentRef<C>,
+        listener: impl Fn(&mut Globals, &T) + 'static,
+    ) {
+        let listener: Rc<dyn Fn(&mut Globals, &T)> = Rc::new(listener);
+        let listener = self
+            .signal_map
+            .get_mut(&sref.0)
+            .expect("invalid signal ref")
+            .as_mut()
+            .expect("signal already borrowed (call trace is mostly likely from a listener for this signal)")
+            .listen(&listener);
+        self.node_mut(cref).listeners.push(ListenerPair {
+            listener,
+            signal: sref.0,
+        })
+    }
+}
+
+impl Globals {
     fn late_unmount_impl(&mut self, cref: impl CRef, v: &mut Vec<u64>) {
         v.push(cref.id());
         let mut component = self.untyped_internal_node_mut(&cref).take();
@@ -480,11 +619,17 @@ impl Globals {
     }
 
     fn unmount_children(&mut self, cref: &impl CRef, reverse: bool) {
+        if !self.map.contains_key(&cref.id()) {
+            return;
+        }
+
         for child in self.untyped_internal_node(cref).children().to_vec() {
-            if reverse {
-                self.reverse_unmount(child);
-            } else {
-                self.unmount(child);
+            if self.map.contains_key(&child.0) {
+                if reverse {
+                    self.reverse_unmount(child);
+                } else {
+                    self.unmount(child);
+                }
             }
         }
     }
@@ -497,5 +642,16 @@ impl Globals {
     #[inline]
     fn untyped_internal_node_mut(&mut self, cref: &impl CRef) -> &mut Box<dyn InternalNode> {
         self.map.get_mut(&cref.id()).expect("invalid reference")
+    }
+}
+
+impl Drop for Globals {
+    fn drop(&mut self) {
+        let keys: Vec<_> = self.map.keys().map(|x| x.clone()).collect();
+        for key in keys {
+            if self.map.contains_key(&key) {
+                self.unmount(UntypedComponentRef(key));
+            }
+        }
     }
 }
